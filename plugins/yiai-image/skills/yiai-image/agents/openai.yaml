@@ -1,0 +1,6 @@
+interface:
+  display_name: "YiAI-image"
+  short_description: "Generate and edit images with YiAI-image and your API key"
+  default_prompt: "Use $yiai-image to generate an image and save it in my workspace."
+policy:
+  allow_implicit_invocation: true

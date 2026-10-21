@@ -1,0 +1,20 @@
+{
+  "name": "yiai",
+  "interface": {
+    "displayName": "YiAI"
+  },
+  "plugins": [
+    {
+      "name": "yiai-image",
+      "source": {
+        "source": "local",
+        "path": "./plugins/yiai-image"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Design"
+    }
+  ]
+}
