@@ -17,12 +17,23 @@ configuration; do not create another credential store or edit installed code.
 ## Inspect And Collect Settings
 
 Run the client's `status` command. Display only whether a key is configured,
-the effective Base URL, and model. Never read the configuration file into the
+where the effective key comes from, the effective Base URL, and model.
+
+The plugin package never contains an API key. A configured key on a new plugin
+installation comes from this computer and Windows/user account: either a saved
+local configuration from an earlier YiAI-image or AigcRouter image installation
+(`configuration_sources.api_key: saved`, stored outside the plugin at
+`config_path`) or the `AIGCROUTER_API_KEY` environment variable
+(`configuration_sources.api_key: environment`). State this source plainly so the
+user is not led to believe the plugin supplied a key. Show `config_path` for a
+saved key, but never its contents. Never read the configuration file into the
 conversation or display a key, even partially. If the user only requested the
 current status, show it and stop without saving anything.
 
-For setup with no supplied choices, ask which settings to configure in one
-concise conversation question. Offer keeping an existing saved key or replacing
+For setup with no supplied choices and an existing key, say the existing key
+was found on this computer and ask whether to keep it or enter the user's own
+key. Do not describe it as configured by the plugin. Otherwise ask which settings
+to configure in one concise conversation question. Offer keeping an existing saved key or replacing
 it, and keeping the current URL/model or supplying new values. A missing key
 must be requested directly in the conversation as the user's AigcRouter user API
 key. Explain that it will be saved in the local user configuration. Preserve

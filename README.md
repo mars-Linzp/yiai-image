@@ -37,6 +37,10 @@ Credentials are stored outside the plugin directory and can be reused.
 
 ## Configure YiAI-image
 
+Version `0.1.3` makes Setup report where an existing key comes from. The
+plugin package contains no key; a key shown on a new installation was already
+saved on that computer or provided through `AIGCROUTER_API_KEY`.
+
 Version `0.1.2` adds image dimension controls for generation and editing.
 Users can ask for exact pixels such as "1536x1024" or ratios such as "16:9"
 and "9:16". Ratio requests default to 2k; users can also request 1k or 4k.
