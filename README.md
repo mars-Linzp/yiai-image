@@ -35,6 +35,23 @@ If migrating from a standalone `yiai-image` skill, keep a backup outside the
 skill discovery directories and remove the duplicate after verifying the plugin.
 Credentials are stored outside the plugin directory and can be reused.
 
+## Configure YiAI-image
+
+Version `0.1.1` adds a conversation-based setup skill, declared through
+`extensions.com.openai.onboardingSkill`. Run the plugin's Setup action when
+available in your Codex client, or ask Codex to configure YiAI-image. This is a
+guided conversation, not a native settings form or a separate web page.
+
+The setup can save or replace your API key, change the Base URL or default model,
+and show the current configuration without revealing the key. Changing only the
+URL or model preserves an already saved key. Defaults remain
+`https://api.aigcrouter.org` and `gpt-image-2.5-sunburst`.
+
+Setup saves settings locally without calling the API or generating a test image.
+Existing `AIGCROUTER_*` environment overrides still take precedence; setup reports
+them without changing the environment. Plugin updates reuse the existing external
+configuration. If a client does not expose Setup, ask: "Configure YiAI-image."
+
 ## Default Image Routing
 
 The skill allows implicit invocation. For a user-wide default, merge
@@ -48,7 +65,8 @@ settings. Installing this plugin does not change a remote gateway's settings.
 
 ## Publish And Refresh
 
-1. Edit the skill under `plugins/yiai-image/skills/yiai-image/`.
+1. Edit the image skill under `plugins/yiai-image/skills/yiai-image/` or the setup
+   skill under `plugins/yiai-image/skills/setup/`.
 2. Run the local checks below.
 3. Increment `plugins/yiai-image/.codex-plugin/plugin.json`'s version.
 4. Commit, push, and create a matching Git tag, such as `v0.1.0`.

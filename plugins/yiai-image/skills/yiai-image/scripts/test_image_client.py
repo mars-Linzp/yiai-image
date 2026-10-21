@@ -114,6 +114,66 @@ class ImageClientTests(unittest.TestCase):
             with self.assertRaises(client.ClientError):
                 client.normalize_base_url(value)
 
+    def test_keep_key_updates_preferences_without_prompting_and_generation_uses_them(self):
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin")
+        with patch("sys.stdin.readline", side_effect=AssertionError("Must not read stdin")), patch.object(client.getpass, "getpass", side_effect=AssertionError("Must not prompt")):
+            result = self.run_client("configure", "--keep-key", "--base-url", self.url, "--model", "chosen-model")
+        saved = json.loads(self.config.read_text())
+        self.assertEqual(saved, {"api_key": FAKE_KEY, "base_url": self.url, "model": "chosen-model"})
+        self.assertNotIn(FAKE_KEY, json.dumps(result))
+        self.assertEqual(self.server.requests, [])
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+        self.run_client("generate", "--prompt", "Test", "--output-dir", str(self.outputs))
+        self.assertEqual(self.server.requests[0]["headers"]["Authorization"], "Bearer " + FAKE_KEY)
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["model"], "chosen-model")
+
+    def test_keep_key_requires_a_saved_key_even_if_environment_is_configured(self):
+        self.authenticate()
+        with self.assertRaisesRegex(client.ClientError, "No saved API key"):
+            self.run_client("configure", "--keep-key", "--model", "chosen-model")
+        self.assertFalse(self.config.exists())
+        status = self.run_client("status")
+        self.assertTrue(status["api_key_configured"])
+        self.assertFalse(status["saved_api_key_configured"])
+        self.assertEqual(status["configuration_sources"]["api_key"], "environment")
+
+    def test_replacing_key_preserves_preferences_and_keep_key_preserves_unspecified_fields(self):
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin", "--base-url", self.url, "--model", "first-model")
+        self.run_client("configure", "--keep-key", "--model", "second-model")
+        self.assertEqual(json.loads(self.config.read_text())["base_url"], self.url)
+        with patch("sys.stdin", io.StringIO("replacement-test-key\n")):
+            self.run_client("configure", "--key-stdin")
+        self.assertEqual(json.loads(self.config.read_text()), {"api_key": "replacement-test-key", "base_url": self.url, "model": "second-model"})
+
+    def test_invalid_preference_update_preserves_existing_configuration(self):
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin")
+        previous = self.config.read_bytes()
+        for option, value in (("--base-url", "http://example.com"), ("--base-url", ""), ("--model", "   ")):
+            with self.subTest(option=option, value=value), self.assertRaises(client.ClientError):
+                self.run_client("configure", "--keep-key", option, value)
+            self.assertEqual(self.config.read_bytes(), previous)
+        self.assertEqual(self.server.requests, [])
+
+    def test_status_reports_effective_sources_without_exposing_keys(self):
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin")
+        status = self.run_client("status")
+        self.assertTrue(status["saved_api_key_configured"])
+        self.assertEqual(status["configuration_sources"], {"api_key": "saved", "base_url": "saved", "model": "saved"})
+        client.os.environ.update({"AIGCROUTER_API_KEY": "environment-test-key", "AIGCROUTER_BASE_URL": self.url, "AIGCROUTER_IMAGE_MODEL": "environment-model"})
+        status = self.run_client("status")
+        self.assertEqual(set(status["configuration_sources"].values()), {"environment"})
+        self.assertEqual(status["base_url"], self.url + "/v1")
+        self.assertEqual(status["model"], "environment-model")
+        self.assertNotIn(FAKE_KEY, json.dumps(status))
+        self.assertNotIn("environment-test-key", json.dumps(status))
+        explicit = self.run_client("status", "--model", "explicit-model")
+        self.assertEqual(explicit["model"], "explicit-model")
+        self.assertEqual(explicit["configuration_sources"]["model"], "command_line")
+
     def test_agent_stdin_in_terminal_uses_hidden_input(self):
         output = io.StringIO()
         with patch("sys.stdin.isatty", return_value=True), patch.object(client.getpass, "getpass", return_value=FAKE_KEY) as hidden_input, redirect_stdout(output):

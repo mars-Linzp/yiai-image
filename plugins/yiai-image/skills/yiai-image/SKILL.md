@@ -74,6 +74,11 @@ Defaults:
 
 ## First Use and Credentials
 
+For a standalone request to configure the plugin, replace a key, or change saved
+preferences, use [YiAI Settings](../setup/SKILL.md). The plugin's Setup entry also
+opens that skill. Continue ordinary image requests below without requiring users
+to complete a separate setup first.
+
 Run `python <skill-dir>/scripts/image_client.py status` first. This reads local
 configuration without making a network request or revealing the key.
 
@@ -114,6 +119,10 @@ An already configured `AIGCROUTER_API_KEY` overrides the saved key. Optional `AI
 `AIGCROUTER_IMAGE_MODEL` override the saved defaults. Explicit CLI options take
 precedence over environment/configuration. Keep these defaults unless the user
 requests an override. Do not silently switch models when one is unavailable.
+The status result includes `configuration_sources` and
+`saved_api_key_configured` without revealing credentials. To change saved URL or
+model preferences while preserving the local key, run `configure --keep-key`
+with only the requested options; this does not prompt for the key again.
 
 ## Generate and Edit
 

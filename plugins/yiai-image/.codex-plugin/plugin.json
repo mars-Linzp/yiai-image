@@ -1,18 +1,24 @@
 {
   "name": "yiai-image",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Generate and edit images with YiAI and your AigcRouter API key.",
   "skills": "./skills/",
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/setup/SKILL.md"
+    }
+  },
   "interface": {
     "displayName": "YiAI-image",
     "shortDescription": "Generate and edit images with YiAI",
-    "longDescription": "Generate and edit images through AigcRouter. On first use, provide your API key in the conversation; the skill saves it locally and reuses it for subsequent requests.",
+    "longDescription": "Generate and edit images through AigcRouter. Use Setup to configure your API key, Base URL, and default model in conversation. Settings are saved locally and reused for subsequent requests.",
     "developerName": "YiAI",
     "category": "Design",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": [
       "Generate an image with YiAI-image and save it in my workspace.",
-      "Edit this image with YiAI-image and display the result."
+      "Edit this image with YiAI-image and display the result.",
+      "Configure my YiAI-image API key, Base URL, and default model."
     ]
   }
 }

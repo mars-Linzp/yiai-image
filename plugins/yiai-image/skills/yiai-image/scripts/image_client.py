@@ -78,17 +78,25 @@ def settings(args):
 
 def configure(args):
     saved = read_config()
-    if not args.key_stdin and not sys.stdin.isatty():
-        raise ClientError("Run configure in an interactive terminal for hidden key input, or use --key-stdin.")
-    if args.key_stdin and not sys.stdin.isatty():
-        key = sys.stdin.readline().strip()
+    if args.keep_key:
+        key = str(saved.get("api_key", "")).strip()
+        if not key:
+            raise ClientError("No saved API key. Ask the user for their key in the conversation and save it with --key-stdin.")
     else:
-        key = getpass.getpass("YiAI-image user API key: ").strip()
+        if not args.key_stdin and not sys.stdin.isatty():
+            raise ClientError("Run configure in an interactive terminal for hidden key input, or use --key-stdin.")
+        if args.key_stdin and not sys.stdin.isatty():
+            key = sys.stdin.readline().strip()
+        else:
+            key = getpass.getpass("YiAI-image user API key: ").strip()
     if not key or any(char.isspace() for char in key):
         raise ClientError("A non-empty API key without whitespace is required.")
-    base = args.base_url or saved.get("base_url") or DEFAULT_BASE_URL
+    base = args.base_url if args.base_url is not None else saved.get("base_url") or DEFAULT_BASE_URL
     normalize_base_url(base)
-    value = {"api_key": key, "base_url": base, "model": args.model or saved.get("model") or DEFAULT_MODEL}
+    model = (args.model if args.model is not None else saved.get("model") or DEFAULT_MODEL).strip()
+    if not model:
+        raise ClientError("The image model must not be empty.")
+    value = {"api_key": key, "base_url": base, "model": model}
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
     fd, temporary = tempfile.mkstemp(prefix=".config-", dir=path.parent)
@@ -249,7 +257,9 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("status", parents=[shared])
     setup = commands.add_parser("configure", parents=[shared])
-    setup.add_argument("--key-stdin", action="store_true", help="Read the API key from stdin instead of a hidden prompt")
+    key_mode = setup.add_mutually_exclusive_group()
+    key_mode.add_argument("--key-stdin", action="store_true", help="Read the API key from stdin instead of a hidden prompt")
+    key_mode.add_argument("--keep-key", action="store_true", help="Keep the saved API key and update preferences without reading stdin")
     for name in ("generate", "edit"):
         command = commands.add_parser(name, parents=[shared])
         prompt = command.add_mutually_exclusive_group(required=True)
@@ -273,7 +283,17 @@ def run(args):
     config = settings(args)
     key, base, model = config["api_key"], config["base_url"], config["model"]
     if args.command == "status":
-        return {"api_key_configured": bool(key), "base_url": base, "model": model, "config_path": str(config_path().resolve())}
+        saved = read_config()
+        sources = {}
+        for name, option, environment in (
+            ("api_key", None, "AIGCROUTER_API_KEY"),
+            ("base_url", args.base_url, "AIGCROUTER_BASE_URL"),
+            ("model", args.model, "AIGCROUTER_IMAGE_MODEL"),
+        ):
+            sources[name] = "command_line" if option else "environment" if os.environ.get(environment) else "saved" if saved.get(name) else "default"
+        if not key:
+            sources["api_key"] = "missing"
+        return {"api_key_configured": bool(key), "saved_api_key_configured": bool(str(saved.get("api_key", "")).strip()), "base_url": base, "model": model, "configuration_sources": sources, "config_path": str(config_path().resolve())}
     if not key:
         raise ClientError("API key required. Ask the user for their AigcRouter user API key in the conversation, save it internally, and resume the pending image request.")
     if args.command == "task":

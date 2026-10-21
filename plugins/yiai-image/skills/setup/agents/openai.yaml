@@ -1,0 +1,6 @@
+interface:
+  display_name: "YiAI Settings"
+  short_description: "Configure YiAI image credentials and model preferences"
+  default_prompt: "Use $setup to configure my YiAI-image API key, Base URL, and default model."
+policy:
+  allow_implicit_invocation: true
