@@ -211,6 +211,29 @@ class ImageClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], "user-requested-model")
         self.assertEqual(payload["size"], "1536x1024")
 
+    def test_aspect_ratio_and_resolution_become_valid_size(self):
+        self.authenticate()
+        for ratio, resolution, expected in (("16:9", None, "2048x1152"), ("9:16", "4k", "2160x3840"), ("4:3", "1k", "1024x768"), ("1:1", "4k", "2880x2880")):
+            self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+            args = ["--aspect-ratio", ratio] + (["--resolution", resolution] if resolution else [])
+            result = self.run_client(*self.request_args("generate", *args))
+            self.assertEqual(json.loads(self.server.requests[-1]["body"])["size"], expected)
+            self.assertEqual(result["requested_size"], expected)
+
+    def test_exact_size_is_normalized_and_invalid_dimensions_are_rejected_locally(self):
+        self.authenticate()
+        image = self.root / "reference.png"
+        image.write_bytes(PNG)
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+        self.run_client(*self.request_args("edit", "--image", str(image), "--size", "1024 * 1536"))
+        self.assertIn(b'name="size"\r\n\r\n1024x1536', self.server.requests[0]["body"])
+        for extra in (("--size", "wide"), ("--aspect-ratio", "4:1"), ("--size", "1024x1024", "--aspect-ratio", "1:1")):
+            with self.assertRaises(SystemExit), patch("sys.stderr"):
+                client.parser().parse_args(self.request_args("generate", *extra))
+        with self.assertRaises(client.ClientError):
+            self.run_client(*self.request_args("generate", "--resolution", "4k"))
+        self.assertEqual(len(self.server.requests), 1)
+
     def test_async_submission_and_polling_never_repeats_post(self):
         self.authenticate()
         self.respond({"task_id": "imgtask_test", "status": "processing"}, status=202)

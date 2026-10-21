@@ -1,6 +1,6 @@
 {
   "name": "yiai-image",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Generate and edit images with YiAI and your AigcRouter API key.",
   "skills": "./skills/",
   "extensions": {
@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "YiAI-image",
     "shortDescription": "Generate and edit images with YiAI",
-    "longDescription": "Generate and edit images through AigcRouter. Use Setup to configure your API key, Base URL, and default model in conversation. Settings are saved locally and reused for subsequent requests.",
+    "longDescription": "Generate and edit images through AigcRouter. Use Setup to configure your API key, Base URL, and default model in conversation. Supports exact image sizes and aspect ratios such as 16:9 and 9:16. Settings are saved locally and reused for subsequent requests.",
     "developerName": "YiAI",
     "category": "Design",
     "capabilities": ["Read", "Write"],

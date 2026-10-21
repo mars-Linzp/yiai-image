@@ -134,13 +134,29 @@ adding unrelated subject matter. Pass prompts as a single argument or use a UTF-
 ```text
 python <skill-dir>/scripts/image_client.py generate --prompt "A red bicycle on a white background"
 python <skill-dir>/scripts/image_client.py generate --prompt-file prompt.txt --size 1536x1024
+python <skill-dir>/scripts/image_client.py generate --prompt "A city skyline" --aspect-ratio 16:9 --resolution 4k
 python <skill-dir>/scripts/image_client.py edit --image reference.png --prompt "Make the background green"
 ```
 
 Use repeatable `--image` for multiple references and optional `--mask` for editing.
-`--size`, `--quality`, `--n`, `--model`, `--base-url`, and `--output-dir` are
-available. Do not send optional image parameters unless they are useful for the
-request. Relative image and output paths resolve against the current workspace.
+`--size`, `--aspect-ratio`, `--resolution`, `--quality`, `--n`, `--model`,
+`--base-url`, and `--output-dir` are available. Do not send optional image
+parameters unless they are useful for the request.
+
+Map image dimensions from the user's request:
+
+- Exact pixels such as "1536x1024" or "1024*1536": use `--size WIDTHxHEIGHT`.
+- A ratio such as "16:9", "9:16", "4:3", "3:4", or "1:1": use
+  `--aspect-ratio WIDTH:HEIGHT`; add `--resolution 1k`, `2k`, or `4k` only when
+  the user specifies a size tier. Ratio-only requests use 2k.
+- Common descriptions: landscape/widescreen means `16:9`, portrait/phone
+  wallpaper means `9:16`, and square means `1:1`, unless the user gives another
+  ratio.
+
+Use either `--size` or `--aspect-ratio`, never both. Ratios above 3:1 are
+rejected. The client converts ratios to dimensions divisible by 16, keeps 4k
+outputs within 3840x2160 total pixels, and reports `requested_size`. For edits,
+omit size options unless the user asks to change output dimensions. Relative image and output paths resolve against the current workspace.
 Keep outputs within that workspace unless the user requests another destination.
 
 The client saves returned base64, data URLs, or downloaded image URLs as files

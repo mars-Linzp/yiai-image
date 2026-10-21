@@ -37,6 +37,10 @@ Credentials are stored outside the plugin directory and can be reused.
 
 ## Configure YiAI-image
 
+Version `0.1.2` adds image dimension controls for generation and editing.
+Users can ask for exact pixels such as "1536x1024" or ratios such as "16:9"
+and "9:16". Ratio requests default to 2k; users can also request 1k or 4k.
+
 Version `0.1.1` adds a conversation-based setup skill, declared through
 `extensions.com.openai.onboardingSkill`. Run the plugin's Setup action when
 available in your Codex client, or ask Codex to configure YiAI-image. This is a

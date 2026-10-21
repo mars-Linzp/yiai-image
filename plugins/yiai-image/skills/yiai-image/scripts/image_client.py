@@ -24,6 +24,9 @@ DEFAULT_BASE_URL = "https://api.aigcrouter.org"
 DEFAULT_MODEL = "gpt-image-2.5-sunburst"
 MAX_RESPONSE = 128 * 1024 * 1024
 MAX_IMAGE = 32 * 1024 * 1024
+RESOLUTION_EDGES = {"1k": 1024, "2k": 2048, "4k": 3840}
+MAX_OUTPUT_PIXELS = 3840 * 2160
+MAX_ASPECT_RATIO = 3
 
 
 class ClientError(Exception):
@@ -247,6 +250,37 @@ def positive_int(value):
     return number
 
 
+def image_size(value):
+    text = value.strip().lower()
+    if text == "auto":
+        return text
+    match = re.fullmatch(r"([1-9][0-9]{0,4})\s*[x*]\s*([1-9][0-9]{0,4})", text)
+    if not match:
+        raise argparse.ArgumentTypeError("use WIDTHxHEIGHT, for example 1536x1024, or auto")
+    return "{}x{}".format(int(match.group(1)), int(match.group(2)))
+
+
+def aspect_ratio(value):
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*[:/]\s*([0-9]+(?:\.[0-9]+)?)\s*", value)
+    if not match or float(match.group(1)) <= 0 or float(match.group(2)) <= 0:
+        raise argparse.ArgumentTypeError("use WIDTH:HEIGHT, for example 16:9")
+    width, height = float(match.group(1)), float(match.group(2))
+    if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
+        raise argparse.ArgumentTypeError("aspect ratio must not exceed 3:1")
+    return width, height
+
+
+def size_from_aspect_ratio(ratio, resolution):
+    width, height = ratio
+    scale = RESOLUTION_EDGES[resolution] / max(width, height)
+    pixels = width * scale * height * scale
+    if pixels > MAX_OUTPUT_PIXELS:
+        scale *= (MAX_OUTPUT_PIXELS / pixels) ** 0.5
+    output_width = max(16, int(width * scale / 16) * 16)
+    output_height = max(16, int(height * scale / 16) * 16)
+    return "{}x{}".format(output_width, output_height)
+
+
 def parser():
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--base-url")
@@ -265,7 +299,10 @@ def parser():
         prompt = command.add_mutually_exclusive_group(required=True)
         prompt.add_argument("--prompt")
         prompt.add_argument("--prompt-file")
-        command.add_argument("--size")
+        dimensions = command.add_mutually_exclusive_group()
+        dimensions.add_argument("--size", type=image_size, help="Exact output size such as 1536x1024, or auto")
+        dimensions.add_argument("--aspect-ratio", type=aspect_ratio, help="Output aspect ratio such as 16:9, 9:16, or 4:3")
+        command.add_argument("--resolution", type=str.lower, choices=sorted(RESOLUTION_EDGES), help="Size tier used with --aspect-ratio; defaults to 2k")
         command.add_argument("--quality")
         command.add_argument("--n", type=positive_int, default=1)
         command.add_argument("--async", action="store_true", dest="asynchronous")
@@ -310,10 +347,14 @@ def run(args):
     prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
     if not prompt.strip():
         raise ClientError("The image prompt must not be empty.")
+    if args.resolution and not args.aspect_ratio:
+        raise ClientError("--resolution requires --aspect-ratio; use --size for an exact size.")
+    size = args.size or (size_from_aspect_ratio(args.aspect_ratio, args.resolution or "2k") if args.aspect_ratio else None)
     payload = {"model": model, "prompt": prompt, "n": args.n}
-    for option in ("size", "quality"):
-        if getattr(args, option):
-            payload[option] = getattr(args, option)
+    if size:
+        payload["size"] = size
+    if args.quality:
+        payload["quality"] = args.quality
     content_type = "application/json"
     endpoint = "/images/generations" if args.command == "generate" else "/images/edits"
     if args.command == "edit":
@@ -325,8 +366,12 @@ def run(args):
         task_id = value.get("task_id") or value.get("id")
         if not task_id:
             raise ClientError("No task ID returned; do not resubmit generation automatically.")
-        return {"task_id": task_id, "status": value.get("status", "processing"), "model": model}
-    return {"status": "completed", "model": model, "files": save_images(value, args.output_dir, args.timeout)}
+        result = {"task_id": task_id, "status": value.get("status", "processing"), "model": model}
+    else:
+        result = {"status": "completed", "model": model, "files": save_images(value, args.output_dir, args.timeout)}
+    if size:
+        result["requested_size"] = size
+    return result
 
 
 def main():
