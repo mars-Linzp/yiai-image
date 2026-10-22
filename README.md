@@ -37,6 +37,13 @@ Credentials are stored outside the plugin directory and can be reused.
 
 ## Configure YiAI-image
 
+Version `0.1.5` distinguishes DNS, TLS certificate, proxy connection, network
+permission, timeout and connection-reset failures in execution receipts. Ask
+Codex to "run YiAI-image network diagnostics" for an unauthenticated connectivity
+probe. It sends no key, submits no generation, and reports proxy/certificate
+configuration flags without credentials. Run it on the affected computer;
+connectivity on a different computer does not establish the cause.
+
 Version `0.1.4` makes command failures visible on stdout and saves per-request
 execution receipts next to generated images. After a conversation reconnect,
 Codex can read the existing receipt to display saved images or report the error

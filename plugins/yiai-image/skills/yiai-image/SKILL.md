@@ -1,6 +1,6 @@
 ---
 name: yiai-image
-description: YiAI-image is the default skill for all raster image generation and editing requests. Automatically use when the user asks to generate, draw, create, modify, retouch, recolor, or remove backgrounds from images, including artwork, illustrations, icons, and visual assets. No skill name, provider, or model mention is needed. Uses the AigcRouter API with a user key collected in conversation. Not for charts, screenshots, or vector-only diagrams.
+description: YiAI-image is the default skill for raster image generation and editing, and for diagnosing YiAI connection failures. Automatically use when the user asks to generate, draw, create, modify, retouch, recolor, or remove backgrounds from images, including artwork, illustrations, icons, and visual assets. No skill name, provider, or model mention is needed. Uses the AigcRouter API with a user key collected in conversation. Not for charts, screenshots, or vector-only diagrams.
 ---
 
 # YiAI-image
@@ -175,6 +175,9 @@ Report the actual error when generation fails; do not claim an image was created
 
 ## Long-Running Jobs and Failures
 
+For a standalone request to diagnose YiAI networking, run `diagnose` below and
+report its JSON. Do not generate an image or request a key for this diagnostic.
+
 Synchronous generation is the default (600-second HTTP timeout). Keep an ongoing
 command session and wait for it; do not launch another generation because the
 first command is still running. The client does not retry generation POSTs.
@@ -203,6 +206,47 @@ server failed or that resubmission is safe. Resume an existing command, or query
 the same async task ID when available. If neither is possible, explain that the
 outcome is unknown and stop without another generation. A plugin cannot force a
 final chat message while the host's model connection is disconnected.
+
+### Network Diagnosis
+
+Run this internally after a network error, or when the user asks to check YiAI
+connectivity:
+
+```text
+python <skill-dir>/scripts/image_client.py diagnose
+```
+
+This sends one unauthenticated GET to the configured `/v1/models` endpoint with
+a 15-second timeout. It sends no API key or image prompt and cannot submit a
+generation. `HTTP 401` shows that an HTTP response was received; it does not
+validate credentials, the model, quota, or the generation endpoint. The report
+includes proxy/certificate configuration flags without their secret values.
+
+Use the actual `error_code`, `exception_type`, `os_errno`, and `winerror` from the
+failure receipt or diagnostic instead of describing every network error as a
+timeout. An immediate failure is not evidence that generation hit its timeout.
+
+- `dns_resolution_failed`: check the API or proxy hostname and DNS.
+- `tls_certificate_verification_failed`: check system time and trusted CA/proxy
+  certificates. Keep TLS verification enabled.
+- `connection_refused`: check the Base URL and whether the local proxy is running.
+- `network_access_denied`: check OS/firewall and host execution permissions. If
+  the host supports an approved network-enabled execution mode, follow that
+  permission flow for a diagnostic. Respect denials and never bypass sandbox
+  restrictions or disable firewall/security settings automatically.
+- `network_timeout`, `connection_reset`, or `tls_error`: inspect the network,
+  proxy and server connection; a POST outcome can still be unknown.
+
+`submission_status: not_sent` identifies failures known to happen before the
+image POST, such as DNS or initial certificate verification. `unknown` cannot
+establish whether the server accepted it. `not_applicable` means the failing
+request was a GET, such as a task query or image download. A download failure
+must not trigger generation again. Do not automatically retry image POSTs.
+
+Diagnostics on this computer cannot establish another computer's network state.
+For a remote user, have their Codex run this same diagnostic through conversation
+and share its sanitized JSON. Do not ask the user to execute scripts or expose
+their API key or proxy credentials.
 
 If the deployment has asynchronous image tasks enabled, use:
 

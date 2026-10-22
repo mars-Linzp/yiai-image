@@ -5,6 +5,7 @@ import argparse
 import base64
 import binascii
 from datetime import datetime, timezone
+import errno
 import getpass
 import http.client
 import json
@@ -13,8 +14,10 @@ import os
 from pathlib import Path
 import re
 import socket
+import ssl
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,9 +34,10 @@ MAX_ASPECT_RATIO = 3
 
 
 class ClientError(Exception):
-    def __init__(self, message, files=None):
+    def __init__(self, message, files=None, details=None):
         super().__init__(message)
         self.files = files or []
+        self.details = details or {}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -124,6 +128,42 @@ def redact(message, key):
     return message[:1000]
 
 
+def network_failure(exc, submitted):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    number = getattr(reason, "errno", None)
+    windows = getattr(reason, "winerror", None)
+    before_send = False
+    if isinstance(reason, socket.gaierror):
+        code, message = "dns_resolution_failed", "Cannot resolve the API or proxy hostname. Check DNS, Base URL and proxy settings."
+        before_send = True
+    elif isinstance(reason, ssl.SSLCertVerificationError):
+        code, message = "tls_certificate_verification_failed", "TLS certificate verification failed. Check the system clock, trusted certificates and HTTPS proxy certificates; keep TLS verification enabled."
+        before_send = True
+    elif isinstance(reason, ssl.SSLError):
+        code, message = "tls_error", "The TLS connection failed. Check HTTPS proxy and TLS configuration."
+    elif isinstance(reason, PermissionError) or number in {errno.EACCES, errno.EPERM} or windows in {5, 10013}:
+        code, message = "network_access_denied", "Network access was denied by the OS, firewall or execution sandbox. Check the host's network permissions."
+    elif isinstance(reason, ConnectionRefusedError) or number == errno.ECONNREFUSED or windows == 10061:
+        code, message = "connection_refused", "The API or proxy refused the connection. Check whether the configured proxy is running and the endpoint is correct."
+        before_send = True
+    elif isinstance(reason, (TimeoutError, socket.timeout)) or number == errno.ETIMEDOUT or windows == 10060:
+        code, message = "network_timeout", "Network request timed out."
+    elif isinstance(reason, ConnectionResetError) or number == errno.ECONNRESET or windows == 10054:
+        code, message = "connection_reset", "The API, proxy or firewall reset the connection."
+    elif number in {errno.ENETUNREACH, errno.EHOSTUNREACH} or windows in {10051, 10065}:
+        code, message = "network_unreachable", "The API or proxy network is unreachable. Check routing, VPN and proxy settings."
+    else:
+        code, message = "network_error", "The network connection failed; inspect the error type, OS error code and network diagnostic."
+    details = {"error_code": code, "exception_type": type(reason).__name__, "submission_status": "not_sent" if submitted and before_send else "unknown" if submitted else "not_applicable"}
+    if isinstance(number, int):
+        details["os_errno"] = number
+    if isinstance(windows, int):
+        details["winerror"] = windows
+    if submitted:
+        message += " The image request was not sent." if before_send else " A submitted generation may still be running; do not automatically resubmit."
+    return ClientError(message, details=details)
+
+
 def request(url, key="", body=None, content_type="application/json", timeout=600, limit=MAX_RESPONSE):
     headers = {"Accept": "application/json" if key else "image/*", "User-Agent": "aigcrouter-image-skill/1"}
     if key:
@@ -145,9 +185,35 @@ def request(url, key="", body=None, content_type="application/json", timeout=600
             detail = error.get("message", "") if isinstance(error, dict) else str(error)
         except (ValueError, AttributeError):
             pass
-        raise ClientError(redact("HTTP {}: {}".format(exc.code, detail or exc.reason), key)) from None
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException):
-        raise ClientError("Network request failed or timed out. A submitted generation may still be running; do not automatically resubmit.") from None
+        raise ClientError(redact("HTTP {}: {}".format(exc.code, detail or exc.reason), key), details={"error_code": "http_error", "http_status": exc.code}) from None
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
+        raise network_failure(exc, body is not None) from None
+
+
+def diagnose(args, config):
+    # No key, prompt or POST: this probe cannot submit an image job.
+    parsed = urllib.parse.urlsplit(config["base_url"])
+    proxies = urllib.request.getproxies()
+    environment = {"https_proxy_configured": bool(proxies.get("https")), "http_proxy_configured": bool(proxies.get("http")), "all_proxy_configured": bool(proxies.get("all")), "proxy_bypassed": urllib.request.proxy_bypass(parsed.hostname), "ssl_cert_file_configured": bool(os.environ.get("SSL_CERT_FILE")), "ssl_cert_dir_configured": bool(os.environ.get("SSL_CERT_DIR"))}
+    if os.environ.get("SSL_CERT_FILE"):
+        try:
+            environment["ssl_cert_file_exists"] = Path(os.environ["SSL_CERT_FILE"]).is_file()
+        except OSError:
+            environment["ssl_cert_file_exists"] = False
+    result = {"status": "completed", "base_url": config["base_url"], "probe_method": "GET", "probe_path": "/models", "credentials_sent": False, "generation_submitted": False, "network_environment": environment}
+    start = time.monotonic()
+    try:
+        request(config["base_url"] + "/models", timeout=args.timeout, limit=1024 * 1024)
+        result["transport_reachable"] = True
+    except ClientError as exc:
+        status = exc.details.get("http_status")
+        if status is not None and status != 407:
+            result.update(transport_reachable=True, http_status=status)
+        else:
+            result.update(status="failed", transport_reachable=False, error=str(exc), **exc.details)
+    result["elapsed_seconds"] = round(time.monotonic() - start, 3)
+    result["note"] = "This unauthenticated probe checks network connectivity only; it does not verify the API key, image model or generation quota."
+    return result
 
 
 def json_request(url, key, payload=None, timeout=600, content_type="application/json", allow_task_error=False):
@@ -222,7 +288,7 @@ def save_images(value, output_dir, timeout):
             with path.open("xb") as stream:
                 stream.write(content)
         except ClientError as exc:
-            raise ClientError(str(exc) + " Do not regenerate.", files=paths) from None
+            raise ClientError(str(exc) + " Do not regenerate.", files=paths, details=exc.details) from None
         except OSError:
             raise ClientError("Cannot save the generated image. Check output paths and permissions; do not regenerate.", files=paths) from None
         paths.append(str(path))
@@ -297,6 +363,7 @@ def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("status", parents=[shared])
+    commands.add_parser("diagnose", parents=[shared], help="Check network connectivity without a key or generating an image").set_defaults(timeout=15)
     result = commands.add_parser("result", help="Read a saved execution receipt without sending an API request")
     result.add_argument("path")
     setup = commands.add_parser("configure", parents=[shared])
@@ -333,6 +400,8 @@ def run(args):
         return configure(args)
     config = settings(args)
     key, base, model = config["api_key"], config["base_url"], config["model"]
+    if args.command == "diagnose":
+        return diagnose(args, config)
     if args.command == "status":
         saved = read_config()
         sources = {}
@@ -433,6 +502,8 @@ def main():
         else:
             message = "Unexpected client error ({}). Do not automatically resubmit generation.".format(type(exc).__name__)
         value = {**metadata, "status": "failed", "error": message, "files": getattr(exc, "files", []), "automatic_retry": False}
+        if isinstance(exc, ClientError):
+            value.update(exc.details)
         exit_code = 1
     if receipt is not None:
         value["finished_at"] = datetime.now(timezone.utc).isoformat()

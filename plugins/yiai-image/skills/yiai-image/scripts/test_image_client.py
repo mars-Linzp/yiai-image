@@ -3,15 +3,18 @@
 import base64
 from collections import deque
 from contextlib import redirect_stderr, redirect_stdout
+import errno
 import io
 import json
 import socket
+import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 import image_client as client
 
@@ -346,8 +349,98 @@ class ImageClientTests(unittest.TestCase):
             code, value = self.cli(*self.request_args())
         self.assertEqual(code, 1)
         self.assertIn("may still be running", value["error"])
+        self.assertEqual(value["error_code"], "network_timeout")
+        self.assertEqual(value["submission_status"], "unknown")
         self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
         opened.assert_called_once()
+
+    def test_network_failures_report_specific_codes_without_raw_exception_secrets(self):
+        self.authenticate()
+        cases = (
+            (socket.gaierror(-2, "secret-dns-context"), "dns_resolution_failed", "not_sent"),
+            (ssl.SSLCertVerificationError(1, "secret-certificate-context"), "tls_certificate_verification_failed", "not_sent"),
+            (PermissionError(errno.EACCES, "secret-sandbox-context"), "network_access_denied", "unknown"),
+            (ConnectionRefusedError(errno.ECONNREFUSED, "secret-proxy-context"), "connection_refused", "not_sent"),
+            (ConnectionResetError(errno.ECONNRESET, "secret-server-context"), "connection_reset", "unknown"),
+            (OSError(errno.ENETUNREACH, "secret-routing-context"), "network_unreachable", "unknown"),
+            (ssl.SSLError(1, "secret-tls-context"), "tls_error", "unknown"),
+            (OSError("secret-other-context"), "network_error", "unknown"),
+        )
+        for reason, expected, submission in cases:
+            with self.subTest(error_code=expected), patch.object(client.urllib.request.OpenerDirector, "open", side_effect=urllib.error.URLError(reason)) as opened:
+                code, value = self.cli(*self.request_args())
+                self.assertEqual(code, 1)
+                self.assertEqual(value["error_code"], expected)
+                self.assertEqual(value["submission_status"], submission)
+                self.assertEqual(value["exception_type"], type(reason).__name__)
+                self.assertNotIn("secret-", json.dumps(value))
+                self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+                opened.assert_called_once()
+
+    def test_windows_socket_access_denial_is_preserved(self):
+        self.authenticate()
+        reason = OSError("private-error-context")
+        reason.winerror = 10013
+        with patch.object(client.urllib.request.OpenerDirector, "open", side_effect=urllib.error.URLError(reason)):
+            code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error_code"], "network_access_denied")
+        self.assertEqual(value["winerror"], 10013)
+        self.assertNotIn("private-error-context", json.dumps(value))
+
+    def test_diagnose_gets_models_without_key_or_generation_even_with_saved_credentials(self):
+        self.authenticate()
+        self.respond({"error": {"message": "Unauthorized"}}, status=401)
+        code, value = self.cli("diagnose", "--base-url", self.url)
+        self.assertEqual(code, 0)
+        self.assertTrue(value["transport_reachable"])
+        self.assertEqual(value["http_status"], 401)
+        self.assertFalse(value["credentials_sent"])
+        self.assertFalse(value["generation_submitted"])
+        self.assertEqual(value["probe_method"], "GET")
+        self.assertNotIn("result_file", value)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.server.requests[0]["path"], "/v1/models")
+        self.assertEqual(self.server.requests[0]["method"], "GET")
+        self.assertEqual(self.server.requests[0]["body"], b"")
+        self.assertNotIn("Authorization", self.server.requests[0]["headers"])
+        self.assertFalse(self.outputs.exists())
+
+    def test_diagnose_works_without_key_and_reports_proxy_and_certificate_flags_without_secrets(self):
+        with patch.dict(client.os.environ, {"HTTPS_PROXY": "http://proxy-user:proxy-secret@proxy.example:8080/private-token", "SSL_CERT_FILE": str(self.root / "missing-ca.pem")}), patch.object(client.urllib.request, "getproxies", return_value={"https": "http://proxy-user:proxy-secret@proxy.example:8080/private-token"}), patch.object(client.urllib.request.OpenerDirector, "open", side_effect=urllib.error.URLError(socket.gaierror(-2, "private-dns-error"))) as opened:
+            code, value = self.cli("diagnose", "--base-url", self.url)
+        self.assertEqual(code, 1)
+        self.assertFalse(value["transport_reachable"])
+        self.assertEqual(value["error_code"], "dns_resolution_failed")
+        self.assertEqual(value["submission_status"], "not_applicable")
+        self.assertTrue(value["network_environment"]["https_proxy_configured"])
+        self.assertTrue(value["network_environment"]["ssl_cert_file_configured"])
+        self.assertFalse(value["network_environment"]["ssl_cert_file_exists"])
+        self.assertNotIn("proxy-secret", json.dumps(value))
+        self.assertNotIn("private-token", json.dumps(value))
+        self.assertNotIn("private-dns-error", json.dumps(value))
+        opened.assert_called_once()
+        self.assertEqual(opened.call_args.kwargs["timeout"], 15)
+        self.assertEqual(self.server.requests, [])
+
+    def test_failed_download_keeps_network_details_and_completed_files(self):
+        self.authenticate()
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}, {"url": self.url + "/image.png"}]})
+        original = client.request
+
+        def fail_download(url, *args, **kwargs):
+            if url.endswith("/image.png"):
+                raise client.network_failure(ConnectionResetError(errno.ECONNRESET, "private-download-error"), False)
+            return original(url, *args, **kwargs)
+
+        with patch.object(client, "request", side_effect=fail_download):
+            code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error_code"], "connection_reset")
+        self.assertEqual(value["submission_status"], "not_applicable")
+        self.assertEqual(len(value["files"]), 1)
+        self.assertEqual(Path(value["files"][0]).read_bytes(), PNG)
+        self.assertEqual(len(self.server.requests), 1)
 
     def test_bad_server_json_and_malformed_image_return_visible_failures(self):
         self.authenticate()
