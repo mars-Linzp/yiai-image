@@ -8,6 +8,8 @@ import io
 import json
 import socket
 import ssl
+import subprocess
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
@@ -178,14 +180,65 @@ class ImageClientTests(unittest.TestCase):
         self.assertEqual(explicit["model"], "explicit-model")
         self.assertEqual(explicit["configuration_sources"]["model"], "command_line")
 
-    def test_agent_stdin_in_terminal_uses_hidden_input(self):
-        output = io.StringIO()
-        with patch("sys.stdin.isatty", return_value=True), patch.object(client.getpass, "getpass", return_value=FAKE_KEY) as hidden_input, redirect_stdout(output):
-            result = self.run_client("configure", "--key-stdin")
-        hidden_input.assert_called_once()
-        self.assertEqual(json.loads(self.config.read_text())["api_key"], FAKE_KEY)
-        self.assertNotIn(FAKE_KEY, json.dumps(result) + output.getvalue())
-        self.assertTrue(self.run_client("status")["api_key_configured"])
+    def test_agent_stdin_rejects_terminal_without_hanging_or_echoing_key(self):
+        with patch("sys.stdin.isatty", return_value=True), patch("sys.stdin.readline", side_effect=AssertionError("Must not read terminal")), patch.object(client.getpass, "getpass", side_effect=AssertionError("Must not use console getpass")):
+            with self.assertRaises(client.ClientError) as context:
+                self.run_client("configure", "--key-stdin")
+        self.assertEqual(context.exception.details["error_code"], "stdin_pipe_required")
+        self.assertFalse(self.config.exists())
+
+    def test_configure_checks_write_permission_before_reading_key(self):
+        with patch.object(client.tempfile, "mkstemp", side_effect=PermissionError(errno.EACCES, "private-path")), patch("sys.stdin.isatty", return_value=False), patch("sys.stdin.readline", side_effect=AssertionError("Must check permissions first")):
+            code, value = self.cli("configure", "--key-stdin")
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error_code"], "configuration_write_denied")
+        self.assertEqual(value["config_path"], str(self.config.resolve()))
+        self.assertEqual(value["os_errno"], errno.EACCES)
+        self.assertNotIn("private-path", json.dumps(value))
+        self.assertFalse(self.config.exists())
+
+    def test_check_config_does_not_request_key_or_change_saved_configuration(self):
+        code, value = self.cli("check-config")
+        self.assertEqual(code, 0)
+        self.assertTrue(value["configuration_writable"])
+        self.assertFalse(self.config.exists())
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin")
+        previous = self.config.read_bytes()
+        with patch("sys.stdin.readline", side_effect=AssertionError("Must not request key")):
+            code, value = self.cli("check-config")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.config.read_bytes(), previous)
+        self.assertNotIn(FAKE_KEY, json.dumps(value))
+        self.assertEqual(self.server.requests, [])
+
+    def test_pipe_input_works_in_real_child_process_without_console_prompt(self):
+        environment = dict(client.os.environ, LOCALAPPDATA=str(self.root / "user-data"), XDG_CONFIG_HOME=str(self.root / "user-data"))
+        command = [sys.executable, "-B", str(Path(client.__file__).resolve())]
+        saved = subprocess.run(command + ["configure", "--key-stdin"], input=FAKE_KEY + "\n", text=True, capture_output=True, timeout=15, env=environment)
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertEqual(saved.stderr, "")
+        self.assertNotIn(FAKE_KEY, saved.stdout)
+        value = json.loads(saved.stdout)
+        self.assertTrue(value["configured"])
+        self.assertEqual(json.loads(Path(value["config_path"]).read_text())["api_key"], FAKE_KEY)
+        status = subprocess.run(command + ["status"], text=True, capture_output=True, timeout=15, env=environment)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(json.loads(status.stdout)["api_key_configured"])
+        self.assertNotIn(FAKE_KEY, status.stdout + status.stderr)
+
+    def test_failed_replace_keeps_previous_configuration_and_cleans_temporary_key(self):
+        with patch("sys.stdin", io.StringIO(FAKE_KEY + "\n")):
+            self.run_client("configure", "--key-stdin")
+        previous = self.config.read_bytes()
+        with patch("sys.stdin", io.StringIO("replacement-test-key\n")), patch.object(client.os, "replace", side_effect=PermissionError(errno.EACCES, "private-write-context")):
+            code, value = self.cli("configure", "--key-stdin")
+        self.assertEqual(code, 1)
+        self.assertEqual(value["error_code"], "configuration_write_denied")
+        self.assertEqual(self.config.read_bytes(), previous)
+        self.assertEqual(list(self.config.parent.glob(".config-*")), [])
+        self.assertNotIn("replacement-test-key", json.dumps(value))
+        self.assertNotIn("private-write-context", json.dumps(value))
 
     def test_generate_saves_base64_and_preserves_default_model_and_auth(self):
         self.authenticate()
@@ -351,8 +404,79 @@ class ImageClientTests(unittest.TestCase):
         self.assertIn("may still be running", value["error"])
         self.assertEqual(value["error_code"], "network_timeout")
         self.assertEqual(value["submission_status"], "unknown")
+        self.assertEqual(value["timeout_seconds"], 600)
+        self.assertIn(value["proxy"]["mode"], {"proxy", "direct"})
         self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
         opened.assert_called_once()
+        self.assertEqual(opened.call_args.kwargs["timeout"], 600)
+
+    def test_generation_edit_and_task_timeouts_are_independent_of_diagnostic_default(self):
+        root = client.parser()
+        cases = (
+            (["generate", "--prompt", "Test"], 600),
+            (["diagnose"], 15),
+            (["edit", "--image", "reference.png", "--prompt", "Test"], 600),
+            (["task", "imgtask_test"], 600),
+            (["generate", "--prompt", "Test", "--timeout", "900"], 900),
+            (["diagnose", "--timeout", "30"], 30),
+            (["generate", "--prompt", "Test"], 600),
+        )
+        for arguments, timeout in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(root.parse_args(arguments).timeout, timeout)
+
+    def test_explicit_generation_timeout_reaches_network_and_receipt(self):
+        self.authenticate()
+        with patch.object(client.urllib.request.OpenerDirector, "open", side_effect=socket.timeout()) as opened:
+            code, value = self.cli(*self.request_args("generate", "--timeout", "900"))
+        self.assertEqual(code, 1)
+        self.assertEqual(value["timeout_seconds"], 900)
+        self.assertEqual(opened.call_args.kwargs["timeout"], 900)
+
+    def test_environment_proxy_is_used_for_post_and_recorded_without_credentials(self):
+        self.authenticate()
+        self.respond({"error": {"message": "Test gateway unavailable"}}, status=503)
+        with patch.dict(client.os.environ, {"http_proxy": self.url}), patch.object(client.urllib.request, "proxy_bypass", return_value=False):
+            code, value = self.cli(*self.request_args("generate", "--base-url", "http://localhost:9"))
+        self.assertEqual(code, 1)
+        self.assertEqual(value["http_status"], 503)
+        self.assertEqual(value["proxy"]["source"], "environment")
+        self.assertEqual(value["proxy"]["mode"], "proxy")
+        self.assertEqual(value["proxy"]["endpoint"]["host"], "127.0.0.1")
+        self.assertEqual(value["proxy"]["endpoint"]["port"], self.server.server_port)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.server.requests[0]["path"], "http://localhost:9/v1/images/generations")
+        self.assertEqual(value["timeout_seconds"], 600)
+
+    def test_proxy_route_omits_password_user_path_and_query_and_respects_bypass(self):
+        proxies = {"https": "http://proxy-user:proxy-password@localhost:7890/private-path?secret-token=hidden"}
+        with patch.object(client.urllib.request, "proxy_bypass", return_value=False):
+            route = client.proxy_route("https://example.com/v1", proxies)
+        self.assertEqual(route["mode"], "proxy")
+        self.assertEqual(route["endpoint"], {"scheme": "http", "host": "localhost", "port": 7890})
+        for secret in ("proxy-user", "proxy-password", "private-path", "secret-token"):
+            self.assertNotIn(secret, json.dumps(route))
+        with patch.object(client.urllib.request, "proxy_bypass", return_value=True):
+            route = client.proxy_route("https://example.com/v1", proxies)
+        self.assertEqual(route["mode"], "direct")
+        self.assertTrue(route["bypassed"])
+
+    def test_system_proxy_mapping_is_used_when_no_environment_proxy_is_present(self):
+        self.authenticate()
+        self.respond({"error": {"message": "Test gateway unavailable"}}, status=503)
+        with patch.object(client.urllib.request, "getproxies", return_value={"http": self.url}), patch.object(client.urllib.request, "getproxies_environment", return_value={}), patch.object(client.urllib.request, "proxy_bypass", return_value=False):
+            code, value = self.cli(*self.request_args("generate", "--base-url", "http://localhost:9"))
+        self.assertEqual(code, 1)
+        self.assertEqual(value["http_status"], 503)
+        self.assertEqual(value["proxy"]["source"], "windows_registry" if client.os.name == "nt" else "system")
+        self.assertEqual(value["proxy"]["mode"], "proxy")
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.server.requests[0]["path"], "http://localhost:9/v1/images/generations")
+
+    def test_all_proxy_alone_is_not_misreported_as_an_https_proxy(self):
+        route = client.proxy_route("https://example.com/v1", {"all": "socks5://localhost:1080"})
+        self.assertEqual(route["mode"], "direct")
+        self.assertTrue(route["all_proxy_only"])
 
     def test_network_failures_report_specific_codes_without_raw_exception_secrets(self):
         self.authenticate()

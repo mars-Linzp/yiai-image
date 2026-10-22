@@ -43,6 +43,9 @@ provided for this request.
 Defaults for a fresh installation are `https://api.aigcrouter.org` and
 `gpt-image-2.5-sunburst`. Restore those preferences only if requested. Never
 silently change the model or provider. Wait for required answers before saving.
+Once a replacement key is supplied, preserve the current URL and model unless
+the user also requested changes. That is sufficient to save; do not ask the user
+to repeat the key or answer another keep/replace question.
 
 `configuration_sources` identifies effective environment overrides. A local save
 does not override `AIGCROUTER_API_KEY`, `AIGCROUTER_BASE_URL`, or
@@ -54,10 +57,12 @@ an environment-only key is not automatically copied into local storage.
 ## Save Internally
 
 For a new or replacement key, follow the credential procedure in
-`../yiai-image/SKILL.md`: start `configure --key-stdin` in an interactive command
-session with hidden input, pass the supplied key through the session's stdin,
-and wait for completion. A direct process-stdin channel is also supported. Never
-put the key in shell commands, arguments, prompt files, logs, or source files.
+[../yiai-image/references/credentials.md](../yiai-image/references/credentials.md).
+First run `check-config` to check write access to the actual user configuration
+directory. Then run `configure --key-stdin` through a non-interactive stdin pipe,
+passing the key in the same tool call. Do not use `tty: true`, console getpass,
+or a long-lived interactive terminal for agent-supplied credentials. Never put
+the key in shell commands, process arguments, prompt files, logs, or source files.
 
 For URL/model changes with a saved key, use `configure --keep-key`. It does not
 read stdin or reveal the saved key. Include `--base-url` and/or `--model` only for

@@ -37,6 +37,18 @@ Credentials are stored outside the plugin directory and can be reused.
 
 ## Configure YiAI-image
 
+Version `0.1.7` fixes a shared argparse default that accidentally reduced image
+generation's HTTP timeout to the diagnostic's 15 seconds. Generation, editing and
+task queries now default to 600 seconds independently; diagnostics remain at 15
+seconds. Failure receipts and diagnostics report the selected proxy source,
+direct/proxy mode, sanitized endpoint and timeout, without proxy credentials.
+
+Version `0.1.6` checks configuration write access before accepting a key and
+uses a non-interactive stdin pipe for conversational setup. Terminal input is
+rejected immediately instead of waiting on Windows console getpass. Permission
+failures identify the actual configuration path and OS error code; the setup
+workflow follows the host's approved access mechanism for that path.
+
 Version `0.1.5` distinguishes DNS, TLS certificate, proxy connection, network
 permission, timeout and connection-reset failures in execution receipts. Ask
 Codex to "run YiAI-image network diagnostics" for an unauthenticated connectivity

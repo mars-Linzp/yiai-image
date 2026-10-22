@@ -47,9 +47,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def config_path():
     if os.name == "nt":
-        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+        configured = os.environ.get("LOCALAPPDATA")
+        root = Path(configured) if configured else Path.home() / "AppData/Local"
     else:
-        root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        configured = os.environ.get("XDG_CONFIG_HOME")
+        root = Path(configured) if configured else Path.home() / ".config"
     # Preserve configured credentials across skill renames.
     return root / "aigcrouter-image" / "config.json"
 
@@ -86,38 +88,68 @@ def settings(args):
     return {"api_key": str(key).strip(), "base_url": normalize_base_url(base), "model": model}
 
 
+def config_write_error(exc, path):
+    denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM}
+    details = {"error_code": "configuration_write_denied" if denied else "configuration_write_failed", "config_path": str(path.resolve())}
+    for name, attribute in (("os_errno", "errno"), ("winerror", "winerror")):
+        number = getattr(exc, attribute, None)
+        if isinstance(number, int):
+            details[name] = number
+    return ClientError("Cannot write YiAI user configuration. Check directory permissions and use the host's approved write-access flow for this config_path.", details=details)
+
+
+def check_config_write():
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
+        if path.exists():
+            with path.open("r+b"):
+                pass
+        fd, temporary = tempfile.mkstemp(prefix=".write-check-", dir=path.parent)
+        os.close(fd)
+        Path(temporary).unlink()
+    except OSError as exc:
+        raise config_write_error(exc, path) from None
+    return {"config_path": str(path.resolve()), "configuration_writable": True}
+
+
 def configure(args):
     saved = read_config()
     if args.keep_key:
         key = str(saved.get("api_key", "")).strip()
         if not key:
             raise ClientError("No saved API key. Ask the user for their key in the conversation and save it with --key-stdin.")
-    else:
-        if not args.key_stdin and not sys.stdin.isatty():
-            raise ClientError("Run configure in an interactive terminal for hidden key input, or use --key-stdin.")
-        if args.key_stdin and not sys.stdin.isatty():
-            key = sys.stdin.readline().strip()
-        else:
-            key = getpass.getpass("YiAI-image user API key: ").strip()
-    if not key or any(char.isspace() for char in key):
-        raise ClientError("A non-empty API key without whitespace is required.")
+    elif args.key_stdin and sys.stdin.isatty():
+        raise ClientError("--key-stdin requires a non-interactive stdin pipe. Pass the key through a process input channel without a terminal; do not use tty or console getpass.", details={"error_code": "stdin_pipe_required"})
+    elif not args.key_stdin and not sys.stdin.isatty():
+        raise ClientError("Use --key-stdin with a non-interactive input pipe.", details={"error_code": "stdin_pipe_required"})
     base = args.base_url if args.base_url is not None else saved.get("base_url") or DEFAULT_BASE_URL
     normalize_base_url(base)
     model = (args.model if args.model is not None else saved.get("model") or DEFAULT_MODEL).strip()
     if not model:
         raise ClientError("The image model must not be empty.")
+    check_config_write()
+    if not args.keep_key:
+        key = sys.stdin.readline().strip() if args.key_stdin else getpass.getpass("YiAI-image user API key: ").strip()
+    if not key or any(char.isspace() for char in key):
+        raise ClientError("A non-empty API key without whitespace is required.")
     value = {"api_key": key, "base_url": base, "model": model}
     path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
-    fd, temporary = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    temporary = None
     try:
+        fd, temporary = tempfile.mkstemp(prefix=".config-", dir=path.parent)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(value, stream)
             stream.write("\n")
         os.replace(temporary, path)
-        path.chmod(0o600)
+    except OSError as exc:
+        raise config_write_error(exc, path) from None
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        if temporary is not None:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass
     return {"configured": True, "config_path": str(path.resolve()), "base_url": base, "model": value["model"]}
 
 
@@ -164,6 +196,23 @@ def network_failure(exc, submitted):
     return ClientError(message, details=details)
 
 
+def proxy_route(url, proxies=None):
+    parsed = urllib.parse.urlsplit(url)
+    proxies = urllib.request.getproxies() if proxies is None else proxies
+    environment = urllib.request.getproxies_environment()
+    source = "environment" if environment else "windows_registry" if os.name == "nt" and proxies else "system" if proxies else "none"
+    raw = proxies.get(parsed.scheme)
+    bypassed = bool(raw) and urllib.request.proxy_bypass(parsed.netloc)
+    result = {"source": source, "mode": "proxy" if raw and not bypassed else "direct", "bypassed": bypassed, "all_proxy_only": bool(proxies.get("all") and not raw)}
+    if raw:
+        try:
+            proxy = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
+            result["endpoint"] = {"scheme": proxy.scheme, "host": proxy.hostname, "port": proxy.port}
+        except ValueError:
+            result["endpoint"] = {"invalid": True}
+    return result
+
+
 def request(url, key="", body=None, content_type="application/json", timeout=600, limit=MAX_RESPONSE):
     headers = {"Accept": "application/json" if key else "image/*", "User-Agent": "aigcrouter-image-skill/1"}
     if key:
@@ -171,8 +220,10 @@ def request(url, key="", body=None, content_type="application/json", timeout=600
     if body is not None:
         headers["Content-Type"] = content_type
     req = urllib.request.Request(url, data=body, headers=headers)
+    proxies = urllib.request.getproxies()
+    connection = {"proxy": proxy_route(url, proxies), "timeout_seconds": timeout, "request_method": req.get_method()}
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as response:
+        with urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler(proxies)).open(req, timeout=timeout) as response:
             content = response.read(limit + 1)
             if len(content) > limit:
                 raise ClientError("Response exceeds the download limit; do not resubmit generation.")
@@ -185,9 +236,11 @@ def request(url, key="", body=None, content_type="application/json", timeout=600
             detail = error.get("message", "") if isinstance(error, dict) else str(error)
         except (ValueError, AttributeError):
             pass
-        raise ClientError(redact("HTTP {}: {}".format(exc.code, detail or exc.reason), key), details={"error_code": "http_error", "http_status": exc.code}) from None
+        raise ClientError(redact("HTTP {}: {}".format(exc.code, detail or exc.reason), key), details={**connection, "error_code": "http_error", "http_status": exc.code}) from None
     except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, http.client.HTTPException) as exc:
-        raise network_failure(exc, body is not None) from None
+        error = network_failure(exc, body is not None)
+        error.details.update(connection)
+        raise error from None
 
 
 def diagnose(args, config):
@@ -200,7 +253,7 @@ def diagnose(args, config):
             environment["ssl_cert_file_exists"] = Path(os.environ["SSL_CERT_FILE"]).is_file()
         except OSError:
             environment["ssl_cert_file_exists"] = False
-    result = {"status": "completed", "base_url": config["base_url"], "probe_method": "GET", "probe_path": "/models", "credentials_sent": False, "generation_submitted": False, "network_environment": environment}
+    result = {"status": "completed", "base_url": config["base_url"], "probe_method": "GET", "probe_path": "/models", "credentials_sent": False, "generation_submitted": False, "network_environment": environment, "proxy": proxy_route(config["base_url"], proxies), "timeout_seconds": args.timeout}
     start = time.monotonic()
     try:
         request(config["base_url"] + "/models", timeout=args.timeout, limit=1024 * 1024)
@@ -358,12 +411,12 @@ def parser():
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--base-url")
     shared.add_argument("--model")
-    shared.add_argument("--timeout", type=positive_int, default=600)
     shared.add_argument("--output-dir", default="output/aigcrouter-images")
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("status", parents=[shared])
-    commands.add_parser("diagnose", parents=[shared], help="Check network connectivity without a key or generating an image").set_defaults(timeout=15)
+    commands.add_parser("check-config", help="Check user configuration write access without reading or changing a key")
+    commands.add_parser("diagnose", parents=[shared], help="Check network connectivity without a key or generating an image")
     result = commands.add_parser("result", help="Read a saved execution receipt without sending an API request")
     result.add_argument("path")
     setup = commands.add_parser("configure", parents=[shared])
@@ -387,10 +440,16 @@ def parser():
             command.add_argument("--mask")
     task = commands.add_parser("task", parents=[shared])
     task.add_argument("task_id")
+    # Parent parser actions are shared; keep command-specific defaults independent.
+    for name, command in commands.choices.items():
+        if name not in {"check-config", "result"}:
+            command.add_argument("--timeout", type=positive_int, default=15 if name == "diagnose" else 600)
     return root
 
 
 def run(args):
+    if args.command == "check-config":
+        return check_config_write()
     if args.command == "result":
         value = json.loads(Path(args.path).read_text(encoding="utf-8"))
         if not isinstance(value, dict) or value.get("command") not in {"generate", "edit", "task"} or not value.get("result_file"):
@@ -482,6 +541,7 @@ def main():
         if args.command in {"generate", "edit", "task"}:
             receipt = Path(args.output_dir).resolve() / ("result-" + uuid.uuid4().hex + ".json")
             metadata.update(result_file=str(receipt), started_at=datetime.now(timezone.utc).isoformat())
+            metadata["timeout_seconds"] = args.timeout
             if args.command == "task":
                 metadata["task_id"] = args.task_id
             # Persist before the POST so a disconnected conversation can find this run.

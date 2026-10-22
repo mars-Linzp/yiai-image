@@ -102,23 +102,21 @@ conversation rather than asking for it again.
 
 Once the user supplies the key, Codex must save it automatically:
 
-1. Start `python <skill-dir>/scripts/image_client.py configure --key-stdin` in
-   an interactive command session (for `exec_command`, use `tty: true`).
-2. The command uses hidden input when attached to a terminal. Send the supplied
-   key and a newline through the session's stdin tool, such as `write_stdin`.
-   When a tool supports direct process input without a terminal, passing the
-   key via that stdin channel also works. Never interpolate it into a command.
-3. Wait for configuration to complete and check `status` without printing the
-   key. Then resume the original generation or edit request automatically.
+1. Read [references/credentials.md](references/credentials.md) and run
+   `python <skill-dir>/scripts/image_client.py check-config` to check write access
+   before starting an input process. Resolve permission failures using the host's
+   approved access flow rather than waiting for a key that cannot be saved.
+2. Run `configure --key-stdin` with the key supplied through a non-interactive
+   stdin pipe in the same tool call. Do not use a terminal, `tty: true`, or
+   `getpass()` for agent-supplied input. The client rejects terminal input
+   immediately because console getpass can wait on a different input channel.
+3. Check command completion and `status` without printing the key, then resume
+   the pending image request. The shared reference covers supported input
+   channels and the fallback when the host cannot provide a pipe.
 
 The key is saved in the local user's configuration directory as JSON. Never
-echo it, put it in command arguments, shell history, source files, or result
-messages. If the available tools cannot supply stdin, use a tool's structured
-file-writing capability to save the configuration in the user configuration
-path returned by `status`, with user-only permissions where supported. Do not
-write credentials in the project or use shell commands containing the key. If
-neither method is available, report the specific tooling limitation; do not
-replace the requested in-chat setup with instructions for the user to run code.
+echo it or put it in shell commands, process arguments, source files, temporary
+project files, or result messages. Do not ask the user to run setup commands.
 
 An already configured `AIGCROUTER_API_KEY` overrides the saved key. Optional `AIGCROUTER_BASE_URL` and
 `AIGCROUTER_IMAGE_MODEL` override the saved defaults. Explicit CLI options take
@@ -181,6 +179,8 @@ report its JSON. Do not generate an image or request a key for this diagnostic.
 Synchronous generation is the default (600-second HTTP timeout). Keep an ongoing
 command session and wait for it; do not launch another generation because the
 first command is still running. The client does not retry generation POSTs.
+Keep the 600-second generation timeout unless the user explicitly requests an
+override. The separate 15-second diagnostic timeout is only for the GET probe.
 
 When an exec tool returns a session or cell ID, continue waiting on that same
 session until it exits. Yielding tool output is not generation failure. Read the
@@ -221,6 +221,20 @@ a 15-second timeout. It sends no API key or image prompt and cannot submit a
 generation. `HTTP 401` shows that an HTTP response was received; it does not
 validate credentials, the model, quota, or the generation endpoint. The report
 includes proxy/certificate configuration flags without their secret values.
+Receipts and diagnostics include `timeout_seconds` and a sanitized `proxy`
+record: `source`, `mode`, `bypassed`, and the endpoint scheme/host/port. This is
+the proxy selected by the HTTP client, not proof of the route inside a VPN, TUN
+adapter or the proxy server. Never expose proxy usernames, passwords or URL
+queries. Check this record before claiming a request went directly or used a
+proxy.
+
+The client follows Python urllib proxy discovery: proxy environment settings
+take priority over system settings; on Windows the fallback reads the current
+user's manual Internet Settings proxy. This client does not evaluate PAC scripts.
+`ALL_PROXY` alone is not an HTTPS proxy mapping in this client; `all_proxy_only`
+reports that situation. A `NO_PROXY`/system bypass rule can select `mode: direct`
+even when an endpoint is configured. Do not change system or proxy environment
+settings automatically; diagnose the affected process's selection first.
 
 Use the actual `error_code`, `exception_type`, `os_errno`, and `winerror` from the
 failure receipt or diagnostic instead of describing every network error as a
