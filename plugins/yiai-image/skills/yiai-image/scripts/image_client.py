@@ -4,6 +4,7 @@
 import argparse
 import base64
 import binascii
+from datetime import datetime, timezone
 import getpass
 import http.client
 import json
@@ -30,7 +31,9 @@ MAX_ASPECT_RATIO = 3
 
 
 class ClientError(Exception):
-    pass
+    def __init__(self, message, files=None):
+        super().__init__(message)
+        self.files = files or []
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -147,7 +150,7 @@ def request(url, key="", body=None, content_type="application/json", timeout=600
         raise ClientError("Network request failed or timed out. A submitted generation may still be running; do not automatically resubmit.") from None
 
 
-def json_request(url, key, payload=None, timeout=600, content_type="application/json"):
+def json_request(url, key, payload=None, timeout=600, content_type="application/json", allow_task_error=False):
     body = json.dumps(payload).encode("utf-8") if isinstance(payload, dict) else payload
     raw, _ = request(url, key, body, content_type, timeout)
     try:
@@ -156,7 +159,7 @@ def json_request(url, key, payload=None, timeout=600, content_type="application/
         raise ClientError("Server returned invalid JSON; do not resubmit generation.") from None
     if not isinstance(value, dict):
         raise ClientError("Server returned an unexpected response; do not resubmit generation.")
-    if value.get("error"):
+    if value.get("error") and not allow_task_error:
         error = value["error"]
         detail = error.get("message", "Image request failed") if isinstance(error, dict) else str(error)
         raise ClientError(redact(detail, key))
@@ -181,6 +184,8 @@ def image_bytes(item, timeout):
             content = base64.b64decode(item["b64_json"], validate=True)
         else:
             url = item.get("url", "")
+            if not isinstance(url, str):
+                raise ClientError("The API returned an invalid image URL; do not resubmit generation.")
             if url.startswith("data:image/") and ";base64," in url:
                 content = base64.b64decode(url.split(",", 1)[1], validate=True)
             else:
@@ -209,15 +214,17 @@ def save_images(value, output_dir, timeout):
     destination.mkdir(parents=True, exist_ok=True)
     paths = []
     for item in data:
-        if not isinstance(item, dict):
-            raise ClientError("Invalid image entry in the response.")
         try:
+            if not isinstance(item, dict):
+                raise ClientError("Invalid image entry in the response.")
             content = image_bytes(item, timeout)
+            path = destination / ("image-" + uuid.uuid4().hex + image_suffix(content))
+            with path.open("xb") as stream:
+                stream.write(content)
         except ClientError as exc:
-            raise ClientError(str(exc) + " Do not regenerate. Already saved files: " + json.dumps(paths)) from None
-        path = destination / ("image-" + uuid.uuid4().hex + image_suffix(content))
-        with path.open("xb") as stream:
-            stream.write(content)
+            raise ClientError(str(exc) + " Do not regenerate.", files=paths) from None
+        except OSError:
+            raise ClientError("Cannot save the generated image. Check output paths and permissions; do not regenerate.", files=paths) from None
         paths.append(str(path))
     return paths
 
@@ -290,6 +297,8 @@ def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("status", parents=[shared])
+    result = commands.add_parser("result", help="Read a saved execution receipt without sending an API request")
+    result.add_argument("path")
     setup = commands.add_parser("configure", parents=[shared])
     key_mode = setup.add_mutually_exclusive_group()
     key_mode.add_argument("--key-stdin", action="store_true", help="Read the API key from stdin instead of a hidden prompt")
@@ -315,6 +324,11 @@ def parser():
 
 
 def run(args):
+    if args.command == "result":
+        value = json.loads(Path(args.path).read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("command") not in {"generate", "edit", "task"} or not value.get("result_file"):
+            raise ClientError("Not a YiAI-image execution receipt.")
+        return value
     if args.command == "configure":
         return configure(args)
     config = settings(args)
@@ -336,10 +350,12 @@ def run(args):
     if args.command == "task":
         if not re.fullmatch(r"[A-Za-z0-9_-]+", args.task_id):
             raise ClientError("Invalid task ID.")
-        task = json_request(base + "/images/tasks/" + args.task_id, key, timeout=args.timeout)
+        task = json_request(base + "/images/tasks/" + args.task_id, key, timeout=args.timeout, allow_task_error=True)
         result = {"task_id": args.task_id, "status": task.get("status")}
-        if task.get("status") == "failed":
+        if task.get("error") or task.get("status") in {"failed", "cancelled", "canceled", "expired"}:
             raise ClientError(redact("Image task failed: " + str(task.get("error", "unknown error")), key))
+        if task.get("status") not in {"processing", "pending", "queued", "running", "completed"}:
+            raise ClientError("Server returned an unknown task status; query the same task instead of generating again.")
         if task.get("status") == "completed":
             payload = task.get("result") or {"data": [{"url": task.get("image_url", "")}]}
             result["files"] = save_images(payload, args.output_dir, args.timeout)
@@ -364,6 +380,8 @@ def run(args):
     value = json_request(base + endpoint, key, payload, args.timeout, content_type)
     if args.asynchronous:
         task_id = value.get("task_id") or value.get("id")
+        if value.get("status") in {"failed", "cancelled", "canceled", "expired"}:
+            return {"task_id": task_id, "status": "failed", "error": "Image task submission returned status: " + value["status"], "automatic_retry": False}
         if not task_id:
             raise ClientError("No task ID returned; do not resubmit generation automatically.")
         result = {"task_id": task_id, "status": value.get("status", "processing"), "model": model}
@@ -374,20 +392,57 @@ def run(args):
     return result
 
 
+def write_receipt(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".result-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=True)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def main():
     args = parser().parse_args()
+    receipt = None
+    metadata = {"command": args.command}
+    exit_code = 0
     try:
-        value = run(args)
-        print(json.dumps(value, ensure_ascii=True))
-        return 0
-    except (ClientError, OSError, ValueError) as exc:
-        # Avoid printing raw filesystem errors, which can contain sensitive URLs.
-        message = str(exc) if isinstance(exc, ClientError) else "Local configuration or file operation failed. Check paths and permissions."
-        print(json.dumps({"error": message}, ensure_ascii=True), file=sys.stderr)
-        return 1
+        if args.command in {"generate", "edit", "task"}:
+            receipt = Path(args.output_dir).resolve() / ("result-" + uuid.uuid4().hex + ".json")
+            metadata.update(result_file=str(receipt), started_at=datetime.now(timezone.utc).isoformat())
+            if args.command == "task":
+                metadata["task_id"] = args.task_id
+            # Persist before the POST so a disconnected conversation can find this run.
+            write_receipt(receipt, {**metadata, "status": "running", "automatic_retry": False})
+            print(json.dumps({**metadata, "status": "running"}), file=sys.stderr, flush=True)
+        value = {**metadata, **run(args)}
+        if value.get("status") in {"failed", "cancelled"}:
+            exit_code = 1
     except (KeyboardInterrupt, EOFError):
-        print(json.dumps({"error": "Cancelled. A submitted generation may still be running; do not automatically resubmit."}), file=sys.stderr)
-        return 130
+        value = {**metadata, "status": "cancelled", "error": "Cancelled. A submitted generation may still be running; do not automatically resubmit.", "automatic_retry": False}
+        exit_code = 130
+    except Exception as exc:
+        # Providers, filesystem exceptions and tracebacks may contain credentials.
+        if isinstance(exc, ClientError):
+            message = str(exc)
+        elif isinstance(exc, (OSError, ValueError)):
+            message = "Local configuration or file operation failed. Check paths and permissions."
+        else:
+            message = "Unexpected client error ({}). Do not automatically resubmit generation.".format(type(exc).__name__)
+        value = {**metadata, "status": "failed", "error": message, "files": getattr(exc, "files", []), "automatic_retry": False}
+        exit_code = 1
+    if receipt is not None:
+        value["finished_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            write_receipt(receipt, value)
+        except OSError:
+            value["receipt_error"] = "Could not save the final execution receipt; use this command output. Do not regenerate."
+    # Failures are results too: keep one terminal JSON record on stdout on all paths.
+    print(json.dumps(value, ensure_ascii=True), flush=True)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from collections import deque
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
@@ -289,11 +290,153 @@ class ImageClientTests(unittest.TestCase):
 
     def test_cli_missing_key_returns_compact_json_error(self):
         output, error = io.StringIO(), io.StringIO()
-        with patch("sys.argv", ["image_client.py", "generate", "--prompt", "Test"]), redirect_stdout(output), redirect_stderr(error):
+        with patch("sys.argv", ["image_client.py", *self.request_args()]), redirect_stdout(output), redirect_stderr(error):
             result = client.main()
         self.assertEqual(result, 1)
-        self.assertEqual(output.getvalue(), "")
-        self.assertIn("API key required", json.loads(error.getvalue())["error"])
+        value = json.loads(output.getvalue())
+        self.assertEqual(value["status"], "failed")
+        self.assertIn("API key required", value["error"])
+        self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+        self.assertEqual(self.server.requests, [])
+
+    def cli(self, *arguments):
+        output, error = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["image_client.py", *arguments]), redirect_stdout(output), redirect_stderr(error):
+            code = client.main()
+        self.assertNotIn("Traceback", error.getvalue())
+        return code, json.loads(output.getvalue())
+
+    def test_cli_http_failure_is_visible_persisted_redacted_and_recoverable_without_key(self):
+        self.authenticate()
+        self.respond({"error": {"message": "Provider unavailable " + FAKE_KEY}}, status=503)
+        code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertEqual(value["status"], "failed")
+        self.assertIn("HTTP 503", value["error"])
+        self.assertNotIn(FAKE_KEY, json.dumps(value))
+        self.assertFalse(value["automatic_retry"])
+        self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+        client.os.environ.clear()
+        recovered_code, recovered = self.cli("result", value["result_file"])
+        self.assertEqual(recovered_code, 1)
+        self.assertEqual(recovered, value)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_cli_success_can_be_recovered_without_generating_again(self):
+        self.authenticate()
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+        code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 0)
+        self.assertEqual(value["status"], "completed")
+        client.os.environ.clear()
+        self.assertEqual(self.cli("result", value["result_file"]), (0, value))
+        self.assertEqual(Path(value["files"][0]).read_bytes(), PNG)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_receipt_exists_before_network_timeout_and_does_not_retry(self):
+        self.authenticate()
+
+        def timeout(*args, **kwargs):
+            receipts = list(self.outputs.glob("result-*.json"))
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(json.loads(receipts[0].read_text())["status"], "running")
+            raise socket.timeout()
+
+        with patch.object(client.urllib.request.OpenerDirector, "open", side_effect=timeout) as opened:
+            code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertIn("may still be running", value["error"])
+        self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+        opened.assert_called_once()
+
+    def test_bad_server_json_and_malformed_image_return_visible_failures(self):
+        self.authenticate()
+        for response in (b"<html>bad gateway</html>", [], {"data": []}, {"data": [{"url": 42}]}):
+            with self.subTest(response=response):
+                if isinstance(response, list):
+                    response = json.dumps(response).encode()
+                self.respond(response)
+                code, value = self.cli(*self.request_args())
+                self.assertEqual(code, 1)
+                self.assertEqual(value["status"], "failed")
+                self.assertTrue(value["error"])
+                self.assertFalse(value["automatic_retry"])
+                self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+        self.assertEqual(len(self.server.requests), 4)
+
+    def test_partial_success_preserves_saved_files_when_later_image_is_invalid(self):
+        self.authenticate()
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}, {"b64_json": "invalid"}]})
+        code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertEqual(len(value["files"]), 1)
+        self.assertEqual(Path(value["files"][0]).read_bytes(), PNG)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_failed_async_task_keeps_task_id_and_reports_error(self):
+        self.authenticate()
+        self.respond({"status": "failed", "error": {"message": "Model unavailable " + FAKE_KEY}})
+        code, value = self.cli(*self.request_args("task", "imgtask_test"))
+        self.assertEqual(code, 1)
+        self.assertEqual(value["task_id"], "imgtask_test")
+        self.assertIn("Model unavailable", value["error"])
+        self.assertNotIn(FAKE_KEY, json.dumps(value))
+        self.assertEqual([request["method"] for request in self.server.requests], ["GET"])
+
+    def test_async_submission_terminal_failure_is_not_reported_as_success(self):
+        self.authenticate()
+        self.respond({"task_id": "imgtask_test", "status": "failed"}, status=202)
+        code, value = self.cli(*self.request_args("generate", "--async"))
+        self.assertEqual(code, 1)
+        self.assertEqual(value["task_id"], "imgtask_test")
+        self.assertTrue(value["error"])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_failure_to_save_final_receipt_keeps_successful_image_in_stdout(self):
+        self.authenticate()
+        self.respond({"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+        original = client.write_receipt
+        calls = []
+
+        def save_once(path, value):
+            calls.append(path)
+            if len(calls) > 1:
+                raise PermissionError()
+            original(path, value)
+
+        with patch.object(client, "write_receipt", side_effect=save_once):
+            code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 0)
+        self.assertEqual(value["status"], "completed")
+        self.assertIn("receipt_error", value)
+        self.assertEqual(Path(value["files"][0]).read_bytes(), PNG)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_unknown_async_status_fails_instead_of_polling_forever(self):
+        self.authenticate()
+        self.respond({"status": "unknown"})
+        code, value = self.cli(*self.request_args("task", "imgtask_test"))
+        self.assertEqual(code, 1)
+        self.assertIn("unknown task status", value["error"])
+
+    def test_interruption_and_unexpected_exception_still_return_an_error(self):
+        for exception, expected in ((KeyboardInterrupt(), 130), (TypeError("secret-debug-context"), 1)):
+            with self.subTest(exception=type(exception).__name__), patch.object(client, "run", side_effect=exception):
+                code, value = self.cli(*self.request_args())
+                self.assertEqual(code, expected)
+                self.assertTrue(value["error"])
+                self.assertNotIn("secret-debug-context", json.dumps(value))
+                self.assertEqual(json.loads(Path(value["result_file"]).read_text()), value)
+
+    def test_cannot_create_receipt_stops_before_network_and_still_reports_failure(self):
+        self.authenticate()
+        with patch.object(client, "write_receipt", side_effect=PermissionError("sensitive path")):
+            code, value = self.cli(*self.request_args())
+        self.assertEqual(code, 1)
+        self.assertEqual(value["status"], "failed")
+        self.assertIn("receipt_error", value)
+        self.assertNotIn("sensitive path", json.dumps(value))
+        self.assertEqual(self.server.requests, [])
 
 
 if __name__ == "__main__":

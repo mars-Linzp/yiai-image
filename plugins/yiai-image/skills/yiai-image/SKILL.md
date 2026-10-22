@@ -67,6 +67,11 @@ prevented completion. Do not return an empty final message or stop after saying
 that the skill was loaded. If a higher-priority native-image requirement prevents
 this workflow, explain that conflict instead of silently switching paths.
 
+The native tool's instruction to finish with no text applies to that native tool,
+not to this HTTP client. A failed YiAI command requires a nonempty final reply
+in the user's language explaining its `error`. Tool output alone is not the final
+reply. Do not mark a failed command as success or stop after a progress update.
+
 Defaults:
 - Base URL: `https://api.aigcrouter.org`
 - Image model: `gpt-image-2.5-sunburst` (the router's model identifier; preserve it).
@@ -160,7 +165,10 @@ omit size options unless the user asks to change output dimensions. Relative ima
 Keep outputs within that workspace unless the user requests another destination.
 
 The client saves returned base64, data URLs, or downloaded image URLs as files
-and prints compact JSON with absolute paths; it never prints the image base64.
+and prints one final JSON record on stdout, including on nonzero exit. It never
+prints image base64. Before sending a request it writes a unique `result-*.json`
+receipt in the output directory and flushes its absolute `result_file` path to
+stderr. The receipt is updated with the result or error when the command ends.
 Inspect a saved image with an available image-viewing tool before describing its
 appearance. Show the result using Markdown image syntax with its absolute path.
 Report the actual error when generation fails; do not claim an image was created.
@@ -170,6 +178,31 @@ Report the actual error when generation fails; do not claim an image was created
 Synchronous generation is the default (600-second HTTP timeout). Keep an ongoing
 command session and wait for it; do not launch another generation because the
 first command is still running. The client does not retry generation POSTs.
+
+When an exec tool returns a session or cell ID, continue waiting on that same
+session until it exits. Yielding tool output is not generation failure. Read the
+final stdout JSON even when the exit code is nonzero. On `failed` or `cancelled`,
+display any saved `files` and give a short final reply containing the concrete
+`error` and `result_file` path. Do not end with an empty message or only "failed".
+
+After a conversation reconnect or missing command output, inspect the existing
+session and its receipt before submitting anything. Read a receipt without an API
+request or credentials using:
+
+```text
+python <skill-dir>/scripts/image_client.py result <absolute-result-file-path>
+```
+
+Use the `result_file` printed for this request; if it was lost, locate the matching
+`result-*.json` by `started_at`, command, and output directory. Do not assume the
+latest receipt belongs to this request when multiple jobs run. A `completed`
+receipt has saved images to display. A `failed` or `cancelled` receipt has an
+error to report. A `processing`, `pending`, or `queued` receipt with a `task_id`
+can be resumed by querying that same task. `running` means no final local result is recorded, not proof the
+server failed or that resubmission is safe. Resume an existing command, or query
+the same async task ID when available. If neither is possible, explain that the
+outcome is unknown and stop without another generation. A plugin cannot force a
+final chat message while the host's model connection is disconnected.
 
 If the deployment has asynchronous image tasks enabled, use:
 

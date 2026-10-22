@@ -1,6 +1,6 @@
 {
   "name": "yiai-image",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Generate and edit images with YiAI and your AigcRouter API key.",
   "skills": "./skills/",
   "extensions": {

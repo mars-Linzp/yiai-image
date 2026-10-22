@@ -37,9 +37,16 @@ Credentials are stored outside the plugin directory and can be reused.
 
 ## Configure YiAI-image
 
+Version `0.1.4` makes command failures visible on stdout and saves per-request
+execution receipts next to generated images. After a conversation reconnect,
+Codex can read the existing receipt to display saved images or report the error
+without submitting another generation. This cannot repair a disconnected host
+model connection or a request routed to a different image tool.
+
 Version `0.1.3` makes Setup report where an existing key comes from. The
-plugin package contains no key; a key shown on a new installation was already
-saved on that computer or provided through `AIGCROUTER_API_KEY`.
+plugin package contains no key. Verify the client's actual `status` result before
+claiming a key is configured; a real configured result identifies a saved key or
+an `AIGCROUTER_API_KEY` environment override.
 
 Version `0.1.2` adds image dimension controls for generation and editing.
 Users can ask for exact pixels such as "1536x1024" or ratios such as "16:9"
